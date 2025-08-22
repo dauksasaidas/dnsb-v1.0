@@ -1,0 +1,1 @@
+import React from "react"; export default function Meters(){ return <div><h3>Skaitikliai</h3><p>Modulio vieta.</p></div>; }

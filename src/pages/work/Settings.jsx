@@ -1,0 +1,1 @@
+import React from "react"; export default function Settings(){ return <div><h3>Nustatymai</h3><p>Modulio vieta.</p></div>; }

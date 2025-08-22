@@ -1,0 +1,1 @@
+import React from "react"; export default function Reports(){ return <div><h3>Ataskaitos</h3><p>Modulio vieta.</p></div>; }

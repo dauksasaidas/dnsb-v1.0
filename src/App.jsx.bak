@@ -1,0 +1,54 @@
+import React, { useEffect, useState } from "react";
+import Header from "./components/Header";
+import Auth from "./pages/Auth";
+import DnsbSelect from "./pages/DnsbSelect";
+import { T } from "./const/texts";
+import { loadState, saveState, resetState } from "./state/store";
+
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+export default function App() {
+  const [state, setState] = useState(loadState());
+
+  useEffect(() => { saveState(state); }, [state]);
+
+  const pickRole   = (role) => setState(s => ({ ...s, role, selectedOrgId: "" }));
+  const selectOrg  = (id)   => setState(s => ({ ...s, selectedOrgId: id }));
+  const createOrg  = (name) => setState(s => {
+    const id = uid();
+    return { ...s, orgs: [...s.orgs, { id, name }], selectedOrgId: id };
+  });
+  const hardReset  = () => setState(resetState());
+
+  // 1) Prisijungimas
+  if (!state.role) {
+    return (
+      <>
+        <Header state={state} onReset={hardReset} />
+        <Auth onPick={pickRole} />
+      </>
+    );
+  }
+
+  // 2) DNSB pasirinkimas / kūrimas
+  if (!state.selectedOrgId) {
+    return (
+      <>
+        <Header state={state} onReset={hardReset} />
+        <DnsbSelect orgs={state.orgs} onSelect={selectOrg} onCreate={createOrg} />
+      </>
+    );
+  }
+
+  // 3) Darbo zona (kol kas placeholder)
+  return (
+    <>
+      <Header state={state} onReset={hardReset} />
+      <main style={{padding:16}}>
+        <h2 style={{marginTop:0}}>{T.work.title}</h2>
+        <p>{T.work.subtitle}</p>
+        <p>✅ Vaidmuo: <b>{state.role}</b></p>
+      </main>
+    </>
+  );
+}

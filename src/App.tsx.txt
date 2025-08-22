@@ -1,0 +1,1271 @@
+// File: src/App.tsx
+// DNSB (Daugiabučių namų savininkų bendrija) mini apskaitos sistema
+// UI: React + TailwindCSS (klasės), vieno failo MVP su localStorage duomenų saugojimu.
+// Pastaba: komentaruose aiškinamas tik "kodėl" kai aktualu, o ne "kas".
+
+import React, { useEffect, useMemo, useState } from "react";
+
+// =====================
+// Tipai (TypeScript)
+// =====================
+
+type ID = string;
+
+export type Owner = {
+  id: ID;
+  fullName: string;
+  email?: string;
+  phone?: string;
+};
+
+export type Unit = {
+  id: ID;
+  number: string; // Buto numeris
+  ownerId?: ID;
+  areaSqm: number; // Plotas m²
+  residents: number; // Gyventojų sk.
+  note?: string;
+};
+
+export type Tariff = {
+  id: ID;
+  name: string; // pvz., "Laiptinės elektra"
+  unit: "EUR/mėn" | "EUR/m³" | "EUR/kWh" | "EUR/m²" | "EUR/žm";
+  price: number; // be PVM
+  vatPct: number; // PVM %
+  allocation: "by_area" | "by_residents" | "per_unit" | "metered"; // paskirstymo būdas
+};
+
+export type Meter = {
+  id: ID;
+  unitId: ID; // butas
+  name: string; // pvz., "Šaltas vanduo"
+  unitSymbol: "m³" | "kWh";
+  tariffId?: ID; // susietas tarifas
+};
+
+export type Reading = {
+  id: ID;
+  meterId: ID;
+  period: string; // YYYY-MM
+  value: number; // skaitiklio rodmuo periodo pabaigoje
+};
+
+export type InvoiceLine = {
+  id: ID;
+  label: string;
+  qty: number;
+  unit: string;
+  price: number; // be PVM
+  vatPct: number;
+  totalNet: number;
+  totalVat: number;
+  total: number;
+  meta?: Record<string, unknown>;
+};
+
+export type Invoice = {
+  id: ID;
+  unitId: ID;
+  period: string; // YYYY-MM
+  issuedAt: string; // YYYY-MM-DD
+  dueAt: string; // YYYY-MM-DD
+  lines: InvoiceLine[];
+  totalNet: number;
+  totalVat: number;
+  total: number;
+  paid: number; // sum of related payments
+  status: "unpaid" | "partial" | "paid";
+  number: string; // serija/NR
+};
+
+export type Payment = {
+  id: ID;
+  unitId: ID;
+  date: string; // YYYY-MM-DD
+  amount: number; // + mokėjimas
+  reference?: string; // pvz., pavedimo paskirtis
+  invoiceId?: ID; // pasirenkama sąsaja
+};
+
+export type LedgerEntry = {
+  id: ID;
+  date: string;
+  unitId: ID;
+  kind: "invoice" | "payment";
+  amount: number; // + sąskaita, - mokėjimas
+  refId: ID; // invoiceId arba paymentId
+  description?: string;
+};
+
+export type AppState = {
+  owners: Owner[];
+  units: Unit[];
+  tariffs: Tariff[];
+  meters: Meter[];
+  readings: Reading[];
+  invoices: Invoice[];
+  payments: Payment[];
+  ledger: LedgerEntry[];
+  settings: {
+    currency: string; // "EUR"
+    invoiceSeries: string; // pvz., DNSB-2025
+    allocationDefault: "by_area" | "by_residents" | "per_unit";
+    dueDays: number;
+  };
+};
+
+// =====================
+// Pagalbinės funkcijos
+// =====================
+
+const STORAGE_KEY = "dnsb-mini-state-v1";
+
+function uuid(): ID {
+  // Paprastas ID generatorius; UI nenaudoja kolizijoms jautrių dalykų.
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDays(dateISO: string, days: number): string {
+  const d = new Date(dateISO);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function formatCurrency(n: number, currency = "EUR"): string {
+  return new Intl.NumberFormat("lt-LT", { style: "currency", currency }).format(n);
+}
+
+function ymOf(dateISO: string): string {
+  return dateISO.slice(0, 7);
+}
+
+function safeNumber(n: unknown, def = 0): number {
+  const v = typeof n === "number" ? n : Number(n);
+  return Number.isFinite(v) ? v : def;
+}
+
+function clone<T>(x: T): T {
+  return JSON.parse(JSON.stringify(x));
+}
+
+// =====================
+// Pradinė būsena (seed)
+// =====================
+
+const seedState: AppState = {
+  owners: [
+    { id: uuid(), fullName: "Jonas Jonaitis", email: "jonas@example.com", phone: "+37060000001" },
+    { id: uuid(), fullName: "Ieva Ievaite", email: "ieva@example.com" },
+  ],
+  units: [
+    { id: uuid(), number: "1", ownerId: undefined, areaSqm: 45.2, residents: 2 },
+    { id: uuid(), number: "2", ownerId: undefined, areaSqm: 60.0, residents: 3 },
+  ],
+  tariffs: [
+    { id: uuid(), name: "Laiptinės elektra", unit: "EUR/m²", price: 0.15, vatPct: 21, allocation: "by_area" },
+    { id: uuid(), name: "Atliekos", unit: "EUR/žm", price: 2.5, vatPct: 21, allocation: "by_residents" },
+    { id: uuid(), name: "Šaltas vanduo", unit: "EUR/m³", price: 1.7, vatPct: 9, allocation: "metered" },
+  ],
+  meters: [],
+  readings: [],
+  invoices: [],
+  payments: [],
+  ledger: [],
+  settings: {
+    currency: "EUR",
+    invoiceSeries: "DNSB-2025",
+    allocationDefault: "by_area",
+    dueDays: 14,
+  },
+};
+
+// =====================
+// Saugykla
+// =====================
+
+function loadState(): AppState {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return seedState;
+  try {
+    const parsed = JSON.parse(raw);
+    return { ...seedState, ...parsed };
+  } catch {
+    return seedState; // jei sugadinta – grįžtame į seed
+  }
+}
+
+function saveState(state: AppState) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function resetState() {
+  localStorage.removeItem(STORAGE_KEY);
+  window.location.reload();
+}
+
+// =====================
+// Mažos UI plytelės
+// =====================
+
+function Section(props: { title: string; children: React.ReactNode; actions?: React.ReactNode }) {
+  return (
+    <div className="bg-white rounded-2xl shadow p-4 mb-6">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-xl font-semibold">{props.title}</h2>
+        <div className="flex gap-2">{props.actions}</div>
+      </div>
+      {props.children}
+    </div>
+  );
+}
+
+function Label({ children }: { children: React.ReactNode }) {
+  return <label className="text-sm text-gray-700">{children}</label>;
+}
+
+function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  return <input {...props} className={`border rounded-xl px-3 py-2 w-full ${props.className ?? ""}`} />;
+}
+
+function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
+  return <select {...props} className={`border rounded-xl px-3 py-2 w-full ${props.className ?? ""}`}>{props.children}</select>;
+}
+
+function Button(
+  props: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" }
+) {
+  const base = "px-3 py-2 rounded-xl text-sm font-medium border";
+  const styles = {
+    primary: "bg-black text-white border-black",
+    secondary: "bg-gray-100 text-gray-900 border-gray-300",
+    ghost: "bg-transparent text-gray-800 border-transparent hover:bg-gray-100",
+  } as const;
+  return <button {...props} className={`${base} ${styles[props.variant ?? "primary"]} ${props.className ?? ""}`} />;
+}
+
+function Badge({ children }: { children: React.ReactNode }) {
+  return <span className="text-xs rounded-full bg-gray-100 px-2 py-1 border border-gray-200">{children}</span>;
+}
+
+function Table({ children }: { children: React.ReactNode }) {
+  return <table className="w-full text-sm border-separate border-spacing-y-1">{children}</table>;
+}
+
+// =====================
+// Pagrindinis komponentas
+// =====================
+
+export default function App() {
+  const [state, setState] = useState<AppState>(() => loadState());
+  const [tab, setTab] = useState<string>("dashboard");
+
+  useEffect(() => {
+    saveState(state);
+  }, [state]);
+
+  const ownersById = useMemo(() => Object.fromEntries(state.owners.map(o => [o.id, o])), [state.owners]);
+  const unitsById = useMemo(() => Object.fromEntries(state.units.map(u => [u.id, u])), [state.units]);
+  const metersByUnit = useMemo(() => {
+    const m: Record<ID, Meter[]> = {};
+    state.meters.forEach(x => {
+      m[x.unitId] ||= [];
+      m[x.unitId].push(x);
+    });
+    return m;
+  }, [state.meters]);
+
+  // Atlyginame statusus sąskaitoms
+  const invoicesWithStatus = state.invoices.map(inv => {
+    const paid = safeNumber(inv.paid, 0);
+    const status: Invoice["status"] = paid >= inv.total - 0.01 ? "paid" : paid > 0 ? "partial" : "unpaid";
+    return { ...inv, paid, status } as Invoice;
+  });
+
+  // Skolos skaičiavimas
+  const balancesByUnit: Record<ID, number> = useMemo(() => {
+    const bal: Record<ID, number> = {};
+    invoicesWithStatus.forEach(i => {
+      bal[i.unitId] = (bal[i.unitId] || 0) + i.total - i.paid;
+    });
+    state.payments.forEach(p => {
+      // jei mokėjimas neprisegtas, tiesiog minusuojame nuo bendros skolos
+      bal[p.unitId] = (bal[p.unitId] || 0) - p.amount;
+    });
+    return bal;
+  }, [invoicesWithStatus, state.payments]);
+
+  // ===================== CRUD helperiai =====================
+
+  function upsert<T extends { id: ID }>(arr: T[], item: T): T[] {
+    const i = arr.findIndex(x => x.id === item.id);
+    const next = [...arr];
+    if (i === -1) next.push(item);
+    else next[i] = item;
+    return next;
+  }
+
+  function removeById<T extends { id: ID }>(arr: T[], id: ID): T[] {
+    return arr.filter(x => x.id !== id);
+  }
+
+  // ===================== Sąskaitų generavimas =====================
+
+  function generateInvoices(period: string) {
+    // Kodėl: vienoje vietoje apskaičiuojame visų tarifų paskirstymą ir skaitiklių suvartojimą, kad suma būtų deterministinė.
+    const issuedAt = todayISO();
+    const dueAt = addDays(issuedAt, state.settings.dueDays);
+
+    // Paruošiame rodmenis pagal skaitiklį ir periodą
+    const readingsByMeterPeriod: Record<string, Reading[]> = {};
+    for (const r of state.readings) {
+      const key = `${r.meterId}|${r.period}`;
+      (readingsByMeterPeriod[key] ||= []).push(r);
+    }
+
+    const totalArea = state.units.reduce((s, u) => s + u.areaSqm, 0) || 1;
+    const totalResidents = state.units.reduce((s, u) => s + u.residents, 0) || 1;
+
+    const newInvoices: Invoice[] = [];
+
+    for (const unit of state.units) {
+      const lines: InvoiceLine[] = [];
+
+      // Fiksuoti/paskirstomi tarifai
+      for (const t of state.tariffs) {
+        if (t.allocation === "metered") continue; // skaitikliams apačioje
+        let qty = 1;
+        if (t.allocation === "by_area") qty = unit.areaSqm / totalArea;
+        if (t.allocation === "by_residents") qty = unit.residents / totalResidents;
+        if (t.allocation === "per_unit") qty = 1 / state.units.length;
+        const net = t.price * qty;
+        const vat = net * (t.vatPct / 100);
+        const total = net + vat;
+        lines.push({
+          id: uuid(),
+          label: t.name,
+          qty,
+          unit: t.unit,
+          price: t.price,
+          vatPct: t.vatPct,
+          totalNet: round2(net),
+          totalVat: round2(vat),
+          total: round2(total),
+        });
+      }
+
+      // Skaitikliai/suvartojimas
+      const unitMeters = state.meters.filter(m => m.unitId === unit.id);
+      for (const m of unitMeters) {
+        const t = m.tariffId ? state.tariffs.find(tt => tt.id === m.tariffId) : undefined;
+        const prevKey = `${m.id}|${prevPeriod(period)}`;
+        const curKey = `${m.id}|${period}`;
+        const prev = (readingsByMeterPeriod[prevKey]?.[0]?.value ?? undefined);
+        const cur = (readingsByMeterPeriod[curKey]?.[0]?.value ?? undefined);
+        const consumption = cur != null && prev != null ? Math.max(0, cur - prev) : 0;
+        const price = t?.price ?? 0;
+        const vatPct = t?.vatPct ?? 0;
+        const net = consumption * price;
+        const vat = net * (vatPct / 100);
+        const total = net + vat;
+        if (consumption > 0) {
+          lines.push({
+            id: uuid(),
+            label: `${m.name} (${period})`,
+            qty: consumption,
+            unit: m.unitSymbol,
+            price,
+            vatPct,
+            totalNet: round2(net),
+            totalVat: round2(vat),
+            total: round2(total),
+            meta: { meterId: m.id, period },
+          });
+        }
+      }
+
+      const totalNet = round2(lines.reduce((s, l) => s + l.totalNet, 0));
+      const totalVat = round2(lines.reduce((s, l) => s + l.totalVat, 0));
+      const total = round2(lines.reduce((s, l) => s + l.total, 0));
+
+      const number = nextInvoiceNumber(state, period, state.settings.invoiceSeries);
+      const inv: Invoice = {
+        id: uuid(),
+        unitId: unit.id,
+        period,
+        issuedAt,
+        dueAt,
+        lines,
+        totalNet,
+        totalVat,
+        total,
+        paid: 0,
+        status: "unpaid",
+        number,
+      };
+      newInvoices.push(inv);
+    }
+
+    // Dubliavimo prevencija: jei to periodo sąskaita tam butui jau yra – ignoruoti/generuoti naują versiją?
+    // MVP: pašaliname esamą to paties periodo sąskaitą ir įrašome naują.
+    const filtered = state.invoices.filter(i => i.period !== period);
+
+    const next = { ...state, invoices: [...filtered, ...newInvoices] };
+    next.ledger = rebuildLedger(next);
+    setState(next);
+  }
+
+  function rebuildLedger(s: AppState): LedgerEntry[] {
+    const ledger: LedgerEntry[] = [];
+    for (const inv of s.invoices) {
+      ledger.push({ id: uuid(), date: inv.issuedAt, unitId: inv.unitId, kind: "invoice", amount: inv.total, refId: inv.id, description: `Sąskaita ${inv.number}` });
+    }
+    for (const p of s.payments) {
+      ledger.push({ id: uuid(), date: p.date, unitId: p.unitId, kind: "payment", amount: -Math.abs(p.amount), refId: p.id, description: p.reference || "Mokėjimas" });
+    }
+    return ledger.sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  function prevPeriod(period: string): string {
+    const [y, m] = period.split("-").map(Number);
+    const d = new Date(y, m - 2, 1);
+    const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    return ym;
+  }
+
+  function nextInvoiceNumber(s: AppState, period: string, series: string) {
+    const count = s.invoices.filter(i => i.period === period).length + 1;
+    return `${series}/${period}/${String(count).padStart(3, "0")}`;
+  }
+
+  function round2(n: number) {
+    return Math.round(n * 100) / 100;
+  }
+
+  // ===================== UI blokai =====================
+
+  function Dashboard() {
+    const totalDebt = Object.values(balancesByUnit).reduce((s, v) => s + (v > 0 ? v : 0), 0);
+    const totalUnits = state.units.length;
+    const unpaid = invoicesWithStatus.filter(i => i.status !== "paid").length;
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="bg-white rounded-2xl shadow p-4">
+          <div className="text-gray-500 text-sm">Bendra skola</div>
+          <div className="text-2xl font-semibold">{formatCurrency(totalDebt, state.settings.currency)}</div>
+        </div>
+        <div className="bg-white rounded-2xl shadow p-4">
+          <div className="text-gray-500 text-sm">Butų skaičius</div>
+          <div className="text-2xl font-semibold">{totalUnits}</div>
+        </div>
+        <div className="bg-white rounded-2xl shadow p-4">
+          <div className="text-gray-500 text-sm">Neapmokėtos sąskaitos</div>
+          <div className="text-2xl font-semibold">{unpaid}</div>
+        </div>
+
+        <Section title="Greiti veiksmai" actions={
+          <>
+            <Button onClick={() => generateInvoices(ymOf(todayISO()))}>Generuoti sąskaitas šiam mėnesiui</Button>
+            <Button variant="secondary" onClick={() => exportJSON(state)}>Eksportuoti JSON</Button>
+            <Button variant="ghost" onClick={() => importJSON(setState)}>Importuoti JSON</Button>
+          </>
+        }>
+          <p className="text-sm text-gray-700">Generuojamos visos sąskaitos pagal tarifus ir rodmenis nurodytam laikotarpiui.</p>
+        </Section>
+
+        <Section title="Skolos pagal butą">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Butas</th>
+                <th className="text-left p-2">Savininkas</th>
+                <th className="text-right p-2">Likutis</th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.units.map(u => (
+                <tr key={u.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">{u.number}</td>
+                  <td className="p-2">{u.ownerId ? ownersById[u.ownerId]?.fullName : <em>Nepaskirta</em>}</td>
+                  <td className="p-2 rounded-r-xl text-right">{formatCurrency(balancesByUnit[u.id] || 0, state.settings.currency)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Units() {
+    const [draft, setDraft] = useState<Partial<Unit>>({ areaSqm: 50, residents: 1 });
+
+    function onSave() {
+      if (!draft.number) return alert("Įveskite buto numerį");
+      const item: Unit = {
+        id: (draft as Unit).id || uuid(),
+        number: String(draft.number),
+        ownerId: draft.ownerId,
+        areaSqm: Number(draft.areaSqm) || 0,
+        residents: Number(draft.residents) || 0,
+        note: draft.note || "",
+      };
+      setState(s => ({ ...s, units: upsert(s.units, item) }));
+      setDraft({ areaSqm: 50, residents: 1 });
+    }
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Section title="Naujas / redaguoti butą" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label>Numeris</Label>
+              <Input value={draft.number || ""} onChange={e => setDraft({ ...draft, number: e.target.value })} />
+            </div>
+            <div>
+              <Label>Savininkas</Label>
+              <Select value={draft.ownerId || ""} onChange={e => setDraft({ ...draft, ownerId: e.target.value || undefined })}>
+                <option value="">—</option>
+                {state.owners.map(o => (
+                  <option key={o.id} value={o.id}>{o.fullName}</option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label>Plotas (m²)</Label>
+              <Input type="number" step="0.01" value={draft.areaSqm ?? 0} onChange={e => setDraft({ ...draft, areaSqm: Number(e.target.value) })} />
+            </div>
+            <div>
+              <Label>Gyventojų sk.</Label>
+              <Input type="number" value={draft.residents ?? 0} onChange={e => setDraft({ ...draft, residents: Number(e.target.value) })} />
+            </div>
+            <div className="col-span-2">
+              <Label>Pastaba</Label>
+              <Input value={draft.note || ""} onChange={e => setDraft({ ...draft, note: e.target.value })} />
+            </div>
+          </div>
+        </Section>
+        <Section title="Butų sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">#</th>
+                <th className="text-left p-2">Savininkas</th>
+                <th className="text-left p-2">Plotas</th>
+                <th className="text-left p-2">Gyv.</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.units.map(u => (
+                <tr key={u.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">{u.number}</td>
+                  <td className="p-2">{u.ownerId ? ownersById[u.ownerId]?.fullName : <em>Nepaskirta</em>}</td>
+                  <td className="p-2">{u.areaSqm} m²</td>
+                  <td className="p-2">{u.residents}</td>
+                  <td className="p-2 rounded-r-xl text-right">
+                    <Button variant="secondary" onClick={() => setDraft(u)}>Redaguoti</Button>
+                    <Button variant="ghost" onClick={() => setState(s => ({ ...s, units: removeById(s.units, u.id) }))}>Šalinti</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Owners() {
+    const [draft, setDraft] = useState<Partial<Owner>>({});
+    function onSave() {
+      if (!draft.fullName) return alert("Įveskite vardą ir pavardę");
+      const item: Owner = { id: (draft as Owner).id || uuid(), fullName: draft.fullName!, email: draft.email || "", phone: draft.phone || "" };
+      setState(s => ({ ...s, owners: upsert(s.owners, item) }));
+      setDraft({});
+    }
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Section title="Naujas / redaguoti savininką" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2">
+              <Label>Vardas Pavardė</Label>
+              <Input value={draft.fullName || ""} onChange={e => setDraft({ ...draft, fullName: e.target.value })} />
+            </div>
+            <div>
+              <Label>El. paštas</Label>
+              <Input value={draft.email || ""} onChange={e => setDraft({ ...draft, email: e.target.value })} />
+            </div>
+            <div>
+              <Label>Telefonas</Label>
+              <Input value={draft.phone || ""} onChange={e => setDraft({ ...draft, phone: e.target.value })} />
+            </div>
+          </div>
+        </Section>
+        <Section title="Savininkų sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Vardas</th>
+                <th className="text-left p-2">El. paštas</th>
+                <th className="text-left p-2">Tel.</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.owners.map(o => (
+                <tr key={o.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">{o.fullName}</td>
+                  <td className="p-2">{o.email}</td>
+                  <td className="p-2">{o.phone}</td>
+                  <td className="p-2 rounded-r-xl text-right">
+                    <Button variant="secondary" onClick={() => setDraft(o)}>Redaguoti</Button>
+                    <Button variant="ghost" onClick={() => setState(s => ({ ...s, owners: removeById(s.owners, o.id) }))}>Šalinti</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Tariffs() {
+    const [draft, setDraft] = useState<Partial<Tariff>>({ unit: "EUR/m²", vatPct: 21, allocation: "by_area" });
+
+    function onSave() {
+      if (!draft.name || !draft.unit) return alert("Pavadinimas ir vienetas privalomi");
+      const item: Tariff = {
+        id: (draft as Tariff).id || uuid(),
+        name: draft.name!,
+        unit: draft.unit as Tariff["unit"],
+        price: Number(draft.price) || 0,
+        vatPct: Number(draft.vatPct) || 0,
+        allocation: (draft.allocation as Tariff["allocation"]) || "by_area",
+      };
+      setState(s => ({ ...s, tariffs: upsert(s.tariffs, item) }));
+      setDraft({ unit: "EUR/m²", vatPct: 21, allocation: "by_area" });
+    }
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Section title="Naujas / redaguoti tarifą" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2">
+              <Label>Pavadinimas</Label>
+              <Input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })} />
+            </div>
+            <div>
+              <Label>Vienetas</Label>
+              <Select value={draft.unit || "EUR/m²"} onChange={e => setDraft({ ...draft, unit: e.target.value as any })}>
+                <option>EUR/mėn</option>
+                <option>EUR/m³</option>
+                <option>EUR/kWh</option>
+                <option>EUR/m²</option>
+                <option>EUR/žm</option>
+              </Select>
+            </div>
+            <div>
+              <Label>Kaina</Label>
+              <Input type="number" step="0.01" value={draft.price ?? 0} onChange={e => setDraft({ ...draft, price: Number(e.target.value) })} />
+            </div>
+            <div>
+              <Label>PVM %</Label>
+              <Input type="number" value={draft.vatPct ?? 21} onChange={e => setDraft({ ...draft, vatPct: Number(e.target.value) })} />
+            </div>
+            <div>
+              <Label>Paskirstymas</Label>
+              <Select value={draft.allocation || "by_area"} onChange={e => setDraft({ ...draft, allocation: e.target.value as any })}>
+                <option value="by_area">Pagal plotą</option>
+                <option value="by_residents">Pagal gyventojus</option>
+                <option value="per_unit">Po lygiai (butui)</option>
+                <option value="metered">Pagal skaitiklį</option>
+              </Select>
+            </div>
+          </div>
+        </Section>
+        <Section title="Tarifų sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Pavadinimas</th>
+                <th className="text-left p-2">Vienetas</th>
+                <th className="text-left p-2">Kaina</th>
+                <th className="text-left p-2">PVM</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.tariffs.map(t => (
+                <tr key={t.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">{t.name}</td>
+                  <td className="p-2">{t.unit}</td>
+                  <td className="p-2">{formatCurrency(t.price, state.settings.currency)}</td>
+                  <td className="p-2">{t.vatPct}%</td>
+                  <td className="p-2 rounded-r-xl text-right">
+                    <Button variant="secondary" onClick={() => setDraft(t)}>Redaguoti</Button>
+                    <Button variant="ghost" onClick={() => setState(s => ({ ...s, tariffs: removeById(s.tariffs, t.id) }))}>Šalinti</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Meters() {
+    const [draft, setDraft] = useState<Partial<Meter>>({ unitSymbol: "m³" });
+
+    function onSave() {
+      if (!draft.unitId || !draft.name) return alert("Pasirinkite butą ir nurodykite pavadinimą");
+      const item: Meter = {
+        id: (draft as Meter).id || uuid(),
+        unitId: draft.unitId!,
+        name: draft.name!,
+        unitSymbol: draft.unitSymbol as any,
+        tariffId: draft.tariffId || undefined,
+      };
+      setState(s => ({ ...s, meters: upsert(s.meters, item) }));
+      setDraft({ unitSymbol: "m³" });
+    }
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Section title="Naujas / redaguoti skaitiklį" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label>Butas</Label>
+              <Select value={draft.unitId || ""} onChange={e => setDraft({ ...draft, unitId: e.target.value })}>
+                <option value="">—</option>
+                {state.units.map(u => (
+                  <option key={u.id} value={u.id}>#{u.number}</option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label>Pavadinimas</Label>
+              <Input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })} />
+            </div>
+            <div>
+              <Label>Vienetas</Label>
+              <Select value={draft.unitSymbol || "m³"} onChange={e => setDraft({ ...draft, unitSymbol: e.target.value as any })}>
+                <option>m³</option>
+                <option>kWh</option>
+              </Select>
+            </div>
+            <div>
+              <Label>Susietas tarifas</Label>
+              <Select value={draft.tariffId || ""} onChange={e => setDraft({ ...draft, tariffId: e.target.value || undefined })}>
+                <option value="">—</option>
+                {state.tariffs.filter(t => t.allocation === "metered").map(t => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </Select>
+            </div>
+          </div>
+        </Section>
+        <Section title="Skaitiklių sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Butas</th>
+                <th className="text-left p-2">Pavadinimas</th>
+                <th className="text-left p-2">Vienetas</th>
+                <th className="text-left p-2">Tarifas</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.meters.map(m => (
+                <tr key={m.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">#{unitsById[m.unitId]?.number}</td>
+                  <td className="p-2">{m.name}</td>
+                  <td className="p-2">{m.unitSymbol}</td>
+                  <td className="p-2">{m.tariffId ? state.tariffs.find(t => t.id === m.tariffId)?.name : <em>—</em>}</td>
+                  <td className="p-2 rounded-r-xl text-right">
+                    <Button variant="secondary" onClick={() => setDraft(m)}>Redaguoti</Button>
+                    <Button variant="ghost" onClick={() => setState(s => ({ ...s, meters: removeById(s.meters, m.id) }))}>Šalinti</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Readings() {
+    const [draft, setDraft] = useState<Partial<Reading>>({ period: ymOf(todayISO()) });
+
+    function onSave() {
+      if (!draft.meterId || !draft.period) return alert("Pasirinkite skaitiklį ir periodą");
+      const item: Reading = {
+        id: (draft as Reading).id || uuid(),
+        meterId: draft.meterId!,
+        period: draft.period!,
+        value: Number(draft.value) || 0,
+      };
+      setState(s => ({ ...s, readings: upsert(s.readings, item) }));
+      setDraft({ period: ymOf(todayISO()) });
+    }
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Section title="Naujas / redaguoti rodmenį" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label>Skaitiklis</Label>
+              <Select value={draft.meterId || ""} onChange={e => setDraft({ ...draft, meterId: e.target.value })}>
+                <option value="">—</option>
+                {state.meters.map(m => (
+                  <option key={m.id} value={m.id}>#{unitsById[m.unitId]?.number} • {m.name}</option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label>Periodas (YYYY-MM)</Label>
+              <Input value={draft.period || ""} onChange={e => setDraft({ ...draft, period: e.target.value })} />
+            </div>
+            <div className="col-span-2">
+              <Label>Rodmuo</Label>
+              <Input type="number" step="0.001" value={draft.value ?? 0} onChange={e => setDraft({ ...draft, value: Number(e.target.value) })} />
+            </div>
+          </div>
+        </Section>
+        <Section title="Rodmenų sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Butas</th>
+                <th className="text-left p-2">Skaitiklis</th>
+                <th className="text-left p-2">Periodas</th>
+                <th className="text-left p-2">Rodmuo</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.readings.map(r => {
+                const m = state.meters.find(x => x.id === r.meterId);
+                return (
+                  <tr key={r.id} className="bg-gray-50">
+                    <td className="p-2 rounded-l-xl">#{m ? unitsById[m.unitId]?.number : "?"}</td>
+                    <td className="p-2">{m?.name}</td>
+                    <td className="p-2">{r.period}</td>
+                    <td className="p-2">{r.value}</td>
+                    <td className="p-2 rounded-r-xl text-right">
+                      <Button variant="secondary" onClick={() => setDraft(r)}>Redaguoti</Button>
+                      <Button variant="ghost" onClick={() => setState(s => ({ ...s, readings: removeById(s.readings, r.id) }))}>Šalinti</Button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Invoices() {
+    const [period, setPeriod] = useState(ymOf(todayISO()));
+
+    function settle(inv: Invoice, amount: number) {
+      if (amount <= 0) return alert("Suma turi būti > 0");
+      const p: Payment = { id: uuid(), unitId: inv.unitId, date: todayISO(), amount, reference: `Apmokėjimas už ${inv.number}`, invoiceId: inv.id };
+      const invoices = state.invoices.map(i => (i.id === inv.id ? { ...i, paid: round2((i.paid || 0) + amount) } : i));
+      const next = { ...state, invoices, payments: [...state.payments, p] };
+      next.ledger = rebuildLedger(next);
+      setState(next);
+    }
+
+    const list = invoicesWithStatus.sort((a, b) => b.issuedAt.localeCompare(a.issuedAt));
+
+    return (
+      <div className="grid grid-cols-1 gap-4">
+        <Section
+          title="Generavimas"
+          actions={<>
+            <Input value={period} onChange={e => setPeriod(e.target.value)} />
+            <Button onClick={() => generateInvoices(period)}>Generuoti</Button>
+          </>}
+        >
+          <p className="text-sm text-gray-700">Periodas YYYY-MM. Jei to mėnesio sąskaitos egzistuoja – jos bus perrašytos.</p>
+        </Section>
+
+        <Section title="Sąskaitų sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Nr.</th>
+                <th className="text-left p-2">Butas</th>
+                <th className="text-left p-2">Periodas</th>
+                <th className="text-left p-2">Suma</th>
+                <th className="text-left p-2">Statusas</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.map(inv => (
+                <tr key={inv.id} className="bg-gray-50 align-top">
+                  <td className="p-2 rounded-l-xl whitespace-nowrap">{inv.number}</td>
+                  <td className="p-2">#{unitsById[inv.unitId]?.number}</td>
+                  <td className="p-2">{inv.period}</td>
+                  <td className="p-2">{formatCurrency(inv.total, state.settings.currency)}</td>
+                  <td className="p-2">
+                    <Badge>{inv.status}</Badge>
+                    <div className="text-xs text-gray-500">Apmokėta: {formatCurrency(inv.paid || 0, state.settings.currency)}</div>
+                  </td>
+                  <td className="p-2 rounded-r-xl text-right">
+                    <Button variant="secondary" onClick={() => printInvoice(inv)}>Spausdinti</Button>
+                    <Button variant="ghost" onClick={() => settle(inv, Math.max(0, inv.total - (inv.paid || 0)))}>Pažymėti kaip apmokėtą</Button>
+                    <Button variant="ghost" onClick={() => setState(s => ({ ...s, invoices: removeById(s.invoices, inv.id) }))}>Šalinti</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function printInvoice(inv: Invoice) {
+    const unit = unitsById[inv.unitId];
+    const owner = unit?.ownerId ? ownersById[unit.ownerId] : undefined;
+    const w = window.open("", "_blank");
+    if (!w) return;
+    // Kodėl: paprastas, savarankiškas spausdinimo HTML, kad neiškraipytų aplikacijos stiliaus.
+    const html = `<!DOCTYPE html>
+<html lang="lt">
+<head>
+<meta charset="utf-8"/>
+<title>Sąskaita ${inv.number}</title>
+<style>
+  *{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Noto Sans","Liberation Sans",Arial,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji";}
+  .wrap{max-width:780px;margin:24px auto;padding:24px;border:1px solid #e5e7eb;border-radius:16px}
+  .row{display:flex;justify-content:space-between;align-items:flex-start}
+  table{width:100%;border-collapse:collapse;margin-top:12px}
+  th,td{padding:8px;border-bottom:1px solid #e5e7eb;text-align:left}
+  .right{text-align:right}
+  .muted{color:#6b7280;font-size:12px}
+  .total{font-size:18px;font-weight:600}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row">
+      <div>
+        <h2>DNSB Sąskaita</h2>
+        <div class="muted">Serija: ${inv.number}</div>
+      </div>
+      <div>
+        <div><strong>Butas:</strong> #${unit?.number}</div>
+        <div><strong>Savininkas:</strong> ${owner?.fullName ?? "—"}</div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div class="muted">Išrašyta: ${inv.issuedAt} • Apmokėti iki: ${inv.dueAt}</div>
+      <div class="muted">Periodas: ${inv.period}</div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Paslauga</th>
+          <th class="right">Kiekis</th>
+          <th>Vnt.</th>
+          <th class="right">Kaina (be PVM)</th>
+          <th class="right">PVM %</th>
+          <th class="right">Suma</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${inv.lines
+          .map(
+            l => `<tr>
+              <td>${l.label}</td>
+              <td class="right">${l.qty}</td>
+              <td>${l.unit}</td>
+              <td class="right">${l.price.toFixed(2)}</td>
+              <td class="right">${l.vatPct}</td>
+              <td class="right">${l.total.toFixed(2)}</td>
+            </tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>
+    <div class="row" style="margin-top:16px">
+      <div></div>
+      <div>
+        <div>Viso be PVM: <strong>${inv.totalNet.toFixed(2)}</strong></div>
+        <div>PVM: <strong>${inv.totalVat.toFixed(2)}</strong></div>
+        <div class="total">Mokėti: ${inv.total.toFixed(2)} ${state.settings.currency}</div>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:16px">Apmokėjus nurodykite buto numerį ir sąskaitos seriją.</p>
+  </div>
+  <script>window.onload = () => window.print()</script>
+</body>
+</html>`;
+    w.document.write(html);
+    w.document.close();
+  }
+
+  function Payments() {
+    const [draft, setDraft] = useState<Partial<Payment>>({ date: todayISO(), amount: 0 });
+
+    function onSave() {
+      if (!draft.unitId || !draft.date || !draft.amount) return alert("Butas, data ir suma privalomi");
+      const p: Payment = {
+        id: (draft as Payment).id || uuid(),
+        unitId: draft.unitId!,
+        date: draft.date!,
+        amount: Math.abs(Number(draft.amount) || 0),
+        reference: draft.reference || "",
+        invoiceId: draft.invoiceId || undefined,
+      };
+      const next = { ...state, payments: upsert(state.payments, p) };
+      next.ledger = rebuildLedger(next);
+      setState(next);
+      setDraft({ date: todayISO(), amount: 0 });
+    }
+
+    const unitInvoices = (unitId?: ID) => invoicesWithStatus.filter(i => i.unitId === unitId);
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Section title="Naujas / redaguoti mokėjimą" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label>Butas</Label>
+              <Select value={draft.unitId || ""} onChange={e => setDraft({ ...draft, unitId: e.target.value, invoiceId: "" })}>
+                <option value="">—</option>
+                {state.units.map(u => (
+                  <option key={u.id} value={u.id}>#{u.number}</option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label>Data</Label>
+              <Input type="date" value={draft.date || todayISO()} onChange={e => setDraft({ ...draft, date: e.target.value })} />
+            </div>
+            <div>
+              <Label>Suma</Label>
+              <Input type="number" step="0.01" value={draft.amount ?? 0} onChange={e => setDraft({ ...draft, amount: Number(e.target.value) })} />
+            </div>
+            <div>
+              <Label>Sąskaita (nebūtina)</Label>
+              <Select value={draft.invoiceId || ""} onChange={e => setDraft({ ...draft, invoiceId: e.target.value || undefined })}>
+                <option value="">—</option>
+                {unitInvoices(draft.unitId).map(i => (
+                  <option key={i.id} value={i.id}>{i.number} • {formatCurrency(i.total - (i.paid || 0), state.settings.currency)}</option>
+                ))}
+              </Select>
+            </div>
+            <div className="col-span-2">
+              <Label>Paskirtis</Label>
+              <Input value={draft.reference || ""} onChange={e => setDraft({ ...draft, reference: e.target.value })} />
+            </div>
+          </div>
+        </Section>
+        <Section title="Mokėjimų sąrašas">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Data</th>
+                <th className="text-left p-2">Butas</th>
+                <th className="text-left p-2">Suma</th>
+                <th className="text-left p-2">Paskirtis</th>
+                <th className="p-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.payments.sort((a,b)=>b.date.localeCompare(a.date)).map(p => (
+                <tr key={p.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">{p.date}</td>
+                  <td className="p-2">#{unitsById[p.unitId]?.number}</td>
+                  <td className="p-2">{formatCurrency(p.amount, state.settings.currency)}</td>
+                  <td className="p-2">{p.reference}</td>
+                  <td className="p-2 rounded-r-xl text-right">
+                    <Button variant="secondary" onClick={() => setDraft(p)}>Redaguoti</Button>
+                    <Button variant="ghost" onClick={() => setState(s => ({ ...s, payments: removeById(s.payments, p.id), ledger: rebuildLedger({ ...s, payments: removeById(s.payments, p.id) }) }))}>Šalinti</Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Reports() {
+    const [from, setFrom] = useState<string>(`${new Date().getFullYear()}-01-01`);
+    const [to, setTo] = useState<string>(todayISO());
+
+    const entries = state.ledger.filter(l => l.date >= from && l.date <= to);
+    const income = entries.filter(e => e.kind === "invoice").reduce((s, e) => s + e.amount, 0);
+    const received = -entries.filter(e => e.kind === "payment").reduce((s, e) => s + e.amount, 0);
+
+    return (
+      <div className="grid grid-cols-1 gap-4">
+        <Section title="Filtras">
+          <div className="flex gap-3 items-center">
+            <div>
+              <Label>Nuo</Label>
+              <Input type="date" value={from} onChange={e => setFrom(e.target.value)} />
+            </div>
+            <div>
+              <Label>Iki</Label>
+              <Input type="date" value={to} onChange={e => setTo(e.target.value)} />
+            </div>
+            <div className="ml-auto">
+              <Badge>Priskaičiuota: {formatCurrency(income, state.settings.currency)}</Badge>
+              <span className="mx-2"/>
+              <Badge>Gauta: {formatCurrency(received, state.settings.currency)}</Badge>
+            </div>
+          </div>
+        </Section>
+        <Section title="Didžioji knyga">
+          <Table>
+            <thead>
+              <tr>
+                <th className="text-left p-2">Data</th>
+                <th className="text-left p-2">Butas</th>
+                <th className="text-left p-2">Tipas</th>
+                <th className="text-right p-2">Suma</th>
+                <th className="text-left p-2">Aprašas</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map(e => (
+                <tr key={e.id} className="bg-gray-50">
+                  <td className="p-2 rounded-l-xl">{e.date}</td>
+                  <td className="p-2">#{unitsById[e.unitId]?.number}</td>
+                  <td className="p-2">{e.kind === "invoice" ? "Sąskaita" : "Mokėjimas"}</td>
+                  <td className="p-2 text-right">{formatCurrency(e.amount, state.settings.currency)}</td>
+                  <td className="p-2 rounded-r-xl">{e.description}</td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Section>
+      </div>
+    );
+  }
+
+  function Settings() {
+    const [draft, setDraft] = useState(clone(state.settings));
+    function onSave() {
+      setState(s => ({ ...s, settings: clone(draft) }));
+    }
+    return (
+      <Section title="Nustatymai" actions={<Button onClick={onSave}>Išsaugoti</Button>}>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <Label>Valiuta</Label>
+            <Input value={draft.currency} onChange={e => setDraft({ ...draft, currency: e.target.value })} />
+          </div>
+          <div>
+            <Label>Sąskaitų serija</Label>
+            <Input value={draft.invoiceSeries} onChange={e => setDraft({ ...draft, invoiceSeries: e.target.value })} />
+          </div>
+          <div>
+            <Label>Numatytas paskirstymas</Label>
+            <Select value={draft.allocationDefault} onChange={e => setDraft({ ...draft, allocationDefault: e.target.value as any })}>
+              <option value="by_area">Pagal plotą</option>
+              <option value="by_residents">Pagal gyventojus</option>
+              <option value="per_unit">Po lygiai</option>
+            </Select>
+          </div>
+          <div>
+            <Label>D.d. iki apmokėjimo</Label>
+            <Input type="number" value={draft.dueDays} onChange={e => setDraft({ ...draft, dueDays: Number(e.target.value) })} />
+          </div>
+        </div>
+        <div className="mt-4 flex gap-2">
+          <Button variant="secondary" onClick={() => exportJSON(state)}>Eksportuoti JSON</Button>
+          <Button variant="ghost" onClick={() => importJSON(setState)}>Importuoti JSON</Button>
+          <Button variant="ghost" onClick={resetState}>Atstatyti į gamyklinius</Button>
+        </div>
+      </Section>
+    );
+  }
+
+  // ===================== Pagrindinė navigacija =====================
+
+  const tabs: { id: string; label: string; component: React.ReactNode }[] = [
+    { id: "dashboard", label: "Skydelis", component: <Dashboard /> },
+    { id: "units", label: "Butai", component: <Units /> },
+    { id: "owners", label: "Gyventojai", component: <Owners /> },
+    { id: "tariffs", label: "Tarifai", component: <Tariffs /> },
+    { id: "meters", label: "Skaitikliai", component: <Meters /> },
+    { id: "readings", label: "Rodmenys", component: <Readings /> },
+    { id: "invoices", label: "Sąskaitos", component: <Invoices /> },
+    { id: "payments", label: "Mokėjimai", component: <Payments /> },
+    { id: "reports", label: "Ataskaitos", component: <Reports /> },
+    { id: "settings", label: "Nustatymai", component: <Settings /> },
+  ];
+
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-xl bg-black text-white flex items-center justify-center font-bold">D</div>
+          <div className="font-semibold">DNSB apskaita – mini</div>
+          <div className="ml-auto flex gap-2">
+            {tabs.map(t => (
+              <Button key={t.id} variant={tab === t.id ? "primary" : "secondary"} onClick={() => setTab(t.id)}>{t.label}</Button>
+            ))}
+          </div>
+        </div>
+      </header>
+      <main className="max-w-6xl mx-auto p-4">
+        {tabs.find(t => t.id === tab)?.component}
+      </main>
+      <footer className="max-w-6xl mx-auto px-4 pb-10 text-xs text-gray-500">
+        <div>Duomenys saugomi naršyklėje (localStorage). Testinis rinkinys užkraunamas pirmą kartą.</div>
+      </footer>
+    </div>
+  );
+}
+
+// ===================== Import/Export =====================
+
+function exportJSON(state: AppState) {
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `dnsb-mini-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importJSON(setState: (f: (s: AppState) => AppState) => void) {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = ".json,application/json";
+  inp.onchange = async () => {
+    const file = inp.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const obj = JSON.parse(text);
+      // Kodėl: bent minimali struktūros validacija, kad nesugadintų būsenos.
+      if (!obj || typeof obj !== "object" || !("settings" in obj)) throw new Error("Neteisingas failas");
+      setState(() => obj as AppState);
+    } catch (e: any) {
+      alert("Nepavyko importuoti: " + e.message);
+    }
+  };
+  inp.click();
+}
