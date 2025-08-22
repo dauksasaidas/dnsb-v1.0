@@ -1,3 +1,4 @@
+import { usePersistentOrgs } from "./utils/persistentOrgs";
 import { filterDnsbByRole, filterTabsByRole, canEdit, ROLES } from "./utils/rbac";
 import React, {useEffect, useState, useRef} from "react";
 import Header from "./components/Header";
