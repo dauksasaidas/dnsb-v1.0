@@ -1,3 +1,4 @@
+import OrgsPersist from "./guards/OrgsPersist";
 import { usePersistentOrgs } from "./utils/persistentOrgs";
 import { filterDnsbByRole, filterTabsByRole, canEdit, ROLES } from "./utils/rbac";
 import React, {useEffect, useState, useRef} from "react";
@@ -42,6 +43,7 @@ export default function App() {
   return (
     <div style={{background:"#f3f4f6", minHeight:"100vh"}}>
       <Header state={state} onReset={handleReset}/>
+      <OrgsPersist state={state} setState={setState} />
       <div className="flex gap-2 px-4 mt-2">
         <button className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
                 onClick={() => setState(s => ({ ...s, view: 'dnsb' }))}>
